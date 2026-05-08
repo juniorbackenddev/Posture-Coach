@@ -10,11 +10,11 @@ import Vision
 import simd
 
 @Observable
-@MainActor
 final class PostureViewModel {
     var currentAnalysis: PostureAnalysis?
     var isSessionActive = false
     var sessionElapsed: TimeInterval = 0
+    var countdownRemaining: Int = 0
 
     private(set) var badFrameCount = 0
     private(set) var totalFrameCount = 0
@@ -32,12 +32,14 @@ final class PostureViewModel {
     private var elapsedTask: Task<Void, Never>?
     private var consecutiveBadFrames = 0
 
+    private var analysisEnabled = false
+
     private let badFrameThreshold = 4
     private let warningCooldown: TimeInterval = 8
 
     init() {
         camera.onFrame = { [weak self] buffer in
-            guard let self else { return }
+            guard let self, self.analysisEnabled else { return }
             guard let analysis = self.analyzer.analyze(sampleBuffer: buffer) else { return }
             Task { @MainActor in self.handleAnalysis(analysis) }
         }
@@ -45,14 +47,32 @@ final class PostureViewModel {
 
     // MARK: - Session
 
-    func startSession() {
-        isSessionActive     = true
-        sessionStart        = .now
-        sessionElapsed      = 0
-        badFrameCount       = 0
-        totalFrameCount     = 0
-        lastWarningDate     = nil
-        currentAnalysis     = nil
+    @MainActor func beginWithCountdown() {
+        analyzer.flushEMAHistory()
+        camera.requestPermissionAndStart()
+        countdownRemaining = 2
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            guard countdownRemaining > 0 else { return }
+            countdownRemaining = 1
+            try? await Task.sleep(for: .seconds(1))
+            guard countdownRemaining > 0 else { return }
+            countdownRemaining = 0
+            startSession()
+        }
+    }
+
+    @MainActor func startSession() {
+        analysisEnabled = true
+        analyzer.flushEMAHistory()   // clear any stuck EMA positions from a prior session
+        countdownRemaining   = 0
+        isSessionActive      = true
+        sessionStart         = .now
+        sessionElapsed       = 0
+        badFrameCount        = 0
+        totalFrameCount      = 0
+        lastWarningDate      = nil
+        currentAnalysis      = nil
         consecutiveBadFrames = 0
         HapticManager.shared.sessionTap()
 
@@ -66,7 +86,8 @@ final class PostureViewModel {
         camera.requestPermissionAndStart()
     }
 
-    func stopSession() -> PostureSession {
+    @MainActor func stopSession() -> PostureSession {
+        analysisEnabled = false
         isSessionActive = false
         elapsedTask?.cancel()
         elapsedTask = nil
@@ -80,14 +101,15 @@ final class PostureViewModel {
         )
     }
 
-    func toggleCamera() {
-            camera.switchCamera()
-            analyzer.flushEMAHistory() 
-        }
+    @MainActor func toggleCamera() {
+        camera.switchCamera()
+        // Kamera değiştiği an eski koordinat geçmişini sıfırla
+        analyzer.flushEMAHistory()
+    }
 
     // MARK: - Private
 
-    private func handleAnalysis(_ analysis: PostureAnalysis) {
+    @MainActor private func handleAnalysis(_ analysis: PostureAnalysis) {
         guard isSessionActive else { return }
 
         currentAnalysis  = analysis
@@ -104,7 +126,7 @@ final class PostureViewModel {
         }
     }
 
-    private func triggerWarningIfNeeded() {
+    @MainActor private func triggerWarningIfNeeded() {
         let now = Date.now
         if let last = lastWarningDate, now.timeIntervalSince(last) < warningCooldown { return }
         lastWarningDate = now
